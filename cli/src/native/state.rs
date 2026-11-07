@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CloseTargetParams, CreateTargetParams,
-    CreateTargetResult, EvaluateParams,
+    CreateTargetResult, EvaluateParams, GetTargetsResult, TargetInfo,
 };
 use super::cookies::{self, Cookie};
 use crate::validation::{is_valid_session_name, sanitize_session_component, session_name_error};
@@ -83,6 +83,38 @@ fn parse_origin_storage(data: &Value) -> Option<OriginStorage> {
         local_storage,
         session_storage,
     })
+}
+
+/// Origins of the open page targets in the browser, from a
+/// `Target.getTargets` result. The saving session's `visited_origins` only
+/// records its own navigations, so origins opened solely by an attached
+/// session would otherwise be missing from the save (#2449).
+fn origins_from_targets(target_infos: &[TargetInfo]) -> HashSet<String> {
+    let mut origins = HashSet::new();
+    for target in target_infos {
+        if !super::browser::should_track_target(target) {
+            continue;
+        }
+        if let Ok(parsed) = url::Url::parse(&target.url) {
+            let origin = parsed.origin().ascii_serialization();
+            if origin != "null" && !origin.is_empty() {
+                origins.insert(origin);
+            }
+        }
+    }
+    origins
+}
+
+/// Merge the origins of every open page target into `origins`, so a save
+/// includes localStorage from tabs driven by attached sessions (#2449).
+/// Fail-open: if the target list cannot be read, keep the origins we have.
+async fn collect_open_target_origins(client: &CdpClient, origins: &mut HashSet<String>) {
+    let result: Result<GetTargetsResult, String> = client
+        .send_command_typed("Target.getTargets", &json!({}), None)
+        .await;
+    if let Ok(result) = result {
+        origins.extend(origins_from_targets(&result.target_infos));
+    }
 }
 
 /// Evaluate the storage-collection JS snippet and parse the result.
@@ -282,6 +314,10 @@ pub async fn save_state(
             collect_frame_origins(tree, &mut all_origins);
         }
     }
+
+    // Origins open only in tabs driven by attached sessions are missing from
+    // visited_origins; include every open page target's origin (#2449).
+    collect_open_target_origins(client, &mut all_origins).await;
 
     // 1. Collect localStorage from the current page
     let mut origins = Vec::new();
@@ -1062,5 +1098,35 @@ mod tests {
         let result = dispatch_state_command(&cmd).unwrap();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Missing 'name' parameter");
+    }
+
+    fn target_info(id: &str, target_type: &str, url: &str) -> TargetInfo {
+        TargetInfo {
+            target_id: id.to_string(),
+            target_type: target_type.to_string(),
+            title: String::new(),
+            url: url.to_string(),
+            attached: Some(false),
+            browser_context_id: None,
+        }
+    }
+
+    #[test]
+    fn test_origins_from_targets_includes_attached_session_pages() {
+        // Tabs driven by attached sessions are ordinary page targets; their
+        // origins must be collected even though the saving session never
+        // navigated to them (#2449).
+        let targets = vec![
+            target_info("a", "page", "https://example.com/app"),
+            target_info("b", "page", "https://other.org/"),
+            target_info("c", "page", "https://example.com/other-path"),
+            target_info("d", "page", "about:blank"),
+            target_info("e", "service_worker", "https://example.com/sw.js"),
+            target_info("f", "page", "chrome://newtab/"),
+        ];
+        let origins = origins_from_targets(&targets);
+        assert_eq!(origins.len(), 2);
+        assert!(origins.contains("https://example.com"));
+        assert!(origins.contains("https://other.org"));
     }
 }
