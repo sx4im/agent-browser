@@ -211,6 +211,27 @@ pub const RENDERS_INIT: &str = r#"
   window.__AB_RENDERS_START__ = performance.now();
   window.__AB_RENDERS_ACTIVE__ = true;
 
+  // Fibers already mounted when recording starts. A fiber that has never
+  // been updated has no alternate, so "no alternate" alone cannot tell a
+  // fresh mount from a fiber that mounted long ago; without this baseline
+  // every untouched fiber would be re-counted as a mount on every commit.
+  const mountedFibers = new WeakSet();
+  function markMounted(fiber) {
+    if (!fiber) return;
+    mountedFibers.add(fiber);
+    markMounted(fiber.child);
+    markMounted(fiber.sibling);
+  }
+  try {
+    if (hook.rendererInterfaces && hook.getFiberRoots) {
+      for (const id of hook.rendererInterfaces.keys()) {
+        let roots = null;
+        try { roots = hook.getFiberRoots(id); } catch {}
+        if (roots) roots.forEach((root) => markMounted(root.current));
+      }
+    }
+  } catch {}
+
   function fpsLoop(now) {
     if (fps.last > 0) fps.frames.push(now - fps.last);
     fps.last = now;
@@ -340,12 +361,33 @@ pub const RENDERS_INIT: &str = r#"
   function walkFiber(fiber) {
     if (!fiber) return;
     const tag = fiber.tag;
+    const alt = fiber.alternate;
     if (tag === 0 || tag === 1 || tag === 2 || tag === 11 || tag === 15) {
-      const didRender =
-        fiber.alternate === null ||
-        fiber.flags > 0 ||
-        fiber.memoizedProps !== (fiber.alternate && fiber.alternate.memoizedProps) ||
-        fiber.memoizedState !== (fiber.alternate && fiber.alternate.memoizedState);
+      let didRender = false;
+      if (!alt) {
+        // Never updated since mount: count it as a mount only the first
+        // time this fiber object is seen. A fiber keeps the same object
+        // until its first update, and fibers mounted before recording
+        // started are already in `mountedFibers` (baseline above).
+        if (!mountedFibers.has(fiber)) {
+          mountedFibers.add(fiber);
+          didRender = true;
+        }
+      } else if (fiber.child !== alt.child || (fiber.child === null && alt.child === null)) {
+        // React clones child fibers when a parent renders and reuses them
+        // when it bails out, so an unchanged child list means this subtree
+        // did not change in this commit (the same check React DevTools
+        // uses). A fiber with no children to compare falls back to the
+        // render signals directly. Only then consult the signals: flags
+        // alone are stale (a bailed-out fiber keeps flags such as
+        // MaySuspendCommit from an earlier render), and PerformedWork alone
+        // is not enough either (a never-updated fiber keeps it from its
+        // mount).
+        didRender =
+          (fiber.flags & 1) !== 0 ||
+          fiber.memoizedProps !== alt.memoizedProps ||
+          fiber.memoizedState !== alt.memoizedState;
+      }
       if (didRender) {
         const name = getName(fiber);
         if (name) {
@@ -377,7 +419,13 @@ pub const RENDERS_INIT: &str = r#"
         }
       }
     }
-    walkFiber(fiber.child);
+    // Descend only into subtrees whose child list changed; a bailed-out
+    // subtree reuses the same fiber objects, so nothing below can be new.
+    // A fiber with no alternate has no baseline to compare against, so
+    // always descend into it (its children may have mounted in this commit).
+    if (!alt || fiber.child !== alt.child) {
+      walkFiber(fiber.child);
+    }
     walkFiber(fiber.sibling);
   }
 })()
