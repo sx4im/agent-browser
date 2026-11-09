@@ -337,15 +337,22 @@ pub const RENDERS_INIT: &str = r#"
     return false;
   }
 
+  // React DevTools counts a component as rendered only when it ran user code
+  // in this commit, which React marks with the PerformedWork flag (0x1).
+  // Flags left over from an earlier render stay on fibers React bailed out
+  // on, and a fiber that never updated has no alternate, so neither a
+  // nonzero flag nor a missing alternate proves a render. Descend into a
+  // subtree only when its child list changed in this commit: a bailed out
+  // subtree keeps the same child pointer, so untouched fibers are never
+  // visited and their stale flags are never read.
+  const PERFORMED_WORK = 1;
+
   function walkFiber(fiber) {
     if (!fiber) return;
     const tag = fiber.tag;
+    const prev = fiber.alternate;
     if (tag === 0 || tag === 1 || tag === 2 || tag === 11 || tag === 15) {
-      const didRender =
-        fiber.alternate === null ||
-        fiber.flags > 0 ||
-        fiber.memoizedProps !== (fiber.alternate && fiber.alternate.memoizedProps) ||
-        fiber.memoizedState !== (fiber.alternate && fiber.alternate.memoizedState);
+      const didRender = prev === null || (fiber.flags & PERFORMED_WORK) !== 0;
       if (didRender) {
         const name = getName(fiber);
         if (name) {
@@ -377,7 +384,9 @@ pub const RENDERS_INIT: &str = r#"
         }
       }
     }
-    walkFiber(fiber.child);
+    if (fiber.child !== (prev && prev.child)) {
+      walkFiber(fiber.child);
+    }
     walkFiber(fiber.sibling);
   }
 })()
