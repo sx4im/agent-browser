@@ -46,8 +46,12 @@ pub fn binding_path(session: &str) -> PathBuf {
 /// Reduce a URL to safe diagnostic information before it is persisted or
 /// included in a `tab_gone` error. HTTP and HTTPS retain their origin and
 /// path while credentials, query parameters, and fragments are stripped.
-/// `about:blank` is retained exactly. Other schemes and malformed URLs are
-/// dropped because their opaque payloads may contain secrets.
+/// `file` URLs retain scheme and path only, so a relaunched browser can
+/// restore a local page the same way it restores a hosted one; a local path
+/// is the user's own file location, kept in the same owner-only binding file
+/// as the hosted paths. `about:blank` is retained exactly. Other schemes
+/// and malformed URLs are dropped because their opaque payloads may contain
+/// secrets.
 pub fn sanitize_url(raw: &str) -> String {
     if raw == "about:blank" {
         return raw.to_string();
@@ -57,6 +61,11 @@ pub fn sanitize_url(raw: &str) -> String {
         Ok(mut parsed) if matches!(parsed.scheme(), "http" | "https") => {
             let _ = parsed.set_username("");
             let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Ok(mut parsed) if parsed.scheme() == "file" => {
             parsed.set_query(None);
             parsed.set_fragment(None);
             parsed.to_string()
@@ -468,5 +477,30 @@ mod tests {
             assert!(release_pin("bad").is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), "{not json");
         });
+    }
+
+    #[test]
+    fn test_sanitize_url_keeps_file_urls_for_relaunch_restore() {
+        assert_eq!(
+            sanitize_url("file:///tmp/page.html"),
+            "file:///tmp/page.html"
+        );
+        // Query and fragment are stripped, like HTTP(S).
+        assert_eq!(
+            sanitize_url("file:///tmp/page.html?x=1#frag"),
+            "file:///tmp/page.html"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_url_still_drops_opaque_schemes() {
+        assert_eq!(sanitize_url("about:blank"), "about:blank");
+        assert_eq!(
+            sanitize_url("https://user:pass@example.com/a?x=1#f"),
+            "https://example.com/a"
+        );
+        assert_eq!(sanitize_url("data:text/html,secret"), "");
+        assert_eq!(sanitize_url("chrome://settings"), "");
+        assert_eq!(sanitize_url("not a url"), "");
     }
 }

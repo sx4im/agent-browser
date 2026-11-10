@@ -521,6 +521,25 @@ type IdleLock = std::pin::Pin<
     Box<dyn std::future::Future<Output = tokio::sync::OwnedMutexGuard<DaemonState>> + Send>,
 >;
 
+/// Close the browser after its process exited on its own, remembering the
+/// page it was showing so the next command can report the relaunch and put
+/// the page back instead of landing on about:blank (issue #2505).
+pub(crate) async fn handle_exited_browser(state: &mut DaemonState) {
+    // Record what was lost before closing: the next command relaunches a
+    // fresh browser, and without this record it would report no relaunch
+    // and land on about:blank instead of the page the session was showing.
+    if let Some(url) = state
+        .browser
+        .as_ref()
+        .and_then(|mgr| mgr.active_page_url())
+        .filter(|url| url != "about:blank")
+    {
+        state.last_active_url = Some(url);
+    }
+    state.browser_exited = true;
+    let _ = close_current_browser(state).await;
+}
+
 /// Run the periodic browser maintenance tick in the background, skipping it
 /// when a command holds the state lock. A skipped tick loses nothing: CDP
 /// events stay buffered and autosave is rechecked on the next tick.
@@ -538,7 +557,7 @@ fn spawn_background_tick_if_idle(
             .map(|mgr| mgr.has_process_exited())
             .unwrap_or(false);
         if process_exited {
-            let _ = close_current_browser(&mut state).await;
+            handle_exited_browser(&mut state).await;
         } else if state.browser.is_some() {
             if let Err(error) = state.drain_cdp_events_background().await {
                 let _ = writeln!(

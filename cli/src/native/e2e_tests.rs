@@ -16847,3 +16847,124 @@ async fn e2e_flow_a_route_limited_by_resource_type_applies_the_same_on_both_tier
     }
     let _ = exec(&run(&mut n, json!({ "action": "close" })), &mut state).await;
 }
+
+/// When the browser process dies on its own (issue #2505), the next command
+/// must report the implicit relaunch and put the page back instead of
+/// silently landing on about:blank.
+#[tokio::test]
+#[ignore]
+async fn e2e_browser_exit_reports_relaunch_and_restores_page() {
+    let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let socket_dir = std::env::temp_dir().join(format!(
+        "agent-browser-e2e-2505-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&socket_dir).expect("socket dir should be created");
+    guard.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.to_str().expect("socket dir should be utf-8"),
+    );
+    let session = format!("e2e-2505-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    guard.set("AGENT_BROWSER_SESSION", &session);
+
+    let page_path = socket_dir.join("page.html");
+    std::fs::write(&page_path, "<title>t</title><h1>hello</h1>")
+        .expect("page file should be written");
+    let page_url = format!("file://{}", page_path.to_string_lossy());
+
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({
+            "id": "1",
+            "action": "launch",
+            "headless": true,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+            "allowFileAccess": true
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": page_url.clone() }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(&json!({ "id": "3", "action": "url" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["url"],
+        page_url.as_str(),
+        "page should be open before the browser dies"
+    );
+
+    // Kill the browser out from under the daemon, the way a crash or a user
+    // closing the window does, then run the daemon tick's death path.
+    let mgr = state.browser.as_mut().expect("browser should be running");
+    let _ = mgr
+        .client
+        .send_command_no_params("Browser.close", None)
+        .await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !mgr.has_process_exited() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        state
+            .browser
+            .as_mut()
+            .expect("browser manager should still be present")
+            .has_process_exited(),
+        "browser process should have exited after Browser.close"
+    );
+    super::daemon::handle_exited_browser(&mut state).await;
+    assert!(
+        state.browser.is_none(),
+        "dead browser should be closed by the tick"
+    );
+
+    // The next command relaunches, puts the page back, and says so: the URL
+    // is the file page again, the relaunch is reported, and the settings
+    // report carries the implicit relaunch.
+    let resp = execute_command(&json!({ "id": "4", "action": "url" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(
+        get_data(&resp)["url"],
+        page_url.as_str(),
+        "page should be restored after the browser died: {}",
+        serde_json::to_string_pretty(&resp).unwrap_or_default()
+    );
+    assert_eq!(
+        get_data(&resp)["lifecycle"]["relaunchedBrowser"],
+        true,
+        "implicit relaunch should be reported"
+    );
+    let changes = get_data(&resp)["lifecycle"]["settings"]["changes"]
+        .as_array()
+        .expect("settings changes should be reported");
+    assert!(
+        changes.iter().any(|change| change["option"] == "browser"
+            && change["effect"] == "relaunch"
+            && change["applied"] == true),
+        "settings changes should carry the browser relaunch: {:?}",
+        changes
+    );
+    assert!(
+        resp["warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("previous browser was gone")),
+        "response should warn that the browser was gone: {}",
+        serde_json::to_string_pretty(&resp).unwrap_or_default()
+    );
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}

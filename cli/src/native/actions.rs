@@ -718,6 +718,20 @@ pub struct DaemonState {
     pub pin_tab: bool,
     /// Last binding written to disk, so persistence is write-on-change.
     last_persisted_binding: Option<tab_binding::TabBinding>,
+    /// The browser process exited on its own (crash, kill, closed from
+    /// outside) since the last command, as noticed by the background tick.
+    /// The next command relaunches it; the relaunch is reported and the last
+    /// page is restored instead of silently landing on about:blank.
+    pub browser_exited: bool,
+    /// Last known URL of the active tab when the browser exited, captured
+    /// before the tick closed the dead browser. Restored by the next command
+    /// that implicitly relaunches.
+    pub last_active_url: Option<String>,
+    /// Whether this daemon has ever owned a browser. A fresh daemon resuming
+    /// a session restores the persisted tab binding's URL; a live daemon
+    /// whose browser was closed on command does not, so an explicit close
+    /// keeps meaning a fresh browser next time.
+    pub had_browser: bool,
 }
 
 fn default_idle_shutdown_is_blocked(
@@ -749,6 +763,18 @@ impl DaemonState {
             Running::from_env(),
             Arc::new(crate::session_settings::MemStore::default()),
         )
+    }
+
+    /// A launch or attach just gave this daemon a local browser. The session
+    /// had a browser before, so a later implicit relaunch is not a fresh
+    /// start; and any earlier unexpected-exit record is spent, since the new
+    /// browser replaces whatever was lost.
+    pub fn note_browser_acquired(&mut self) {
+        if self.browser.is_some() {
+            self.had_browser = true;
+            self.browser_exited = false;
+            self.last_active_url = None;
+        }
     }
 
     /// A session that starts with `settings` and keeps its security settings
@@ -863,6 +889,9 @@ impl DaemonState {
             confirmed_policy_actions: HashSet::new(),
             pin_tab,
             last_persisted_binding: None,
+            browser_exited: false,
+            last_active_url: None,
+            had_browser: false,
             settings,
             store,
         }
@@ -3240,6 +3269,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
     let mut lifecycle_reused = false;
     let mut lifecycle_launched = false;
     let mut lifecycle_relaunched_browser = false;
+    // A relaunch that replaced a browser which went away on its own, reported
+    // to the caller once the command succeeds.
+    let mut relaunch_report: Option<String> = None;
     // The flow is read once per command: policy, confirmation and the run all
     // see the same file.
     let mut run_flow = match load_run_flow(cmd, action, state) {
@@ -3372,6 +3404,31 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
 
     if !skip_launch {
         if needs_launch {
+            // The page the session was showing before this relaunch, if the
+            // browser went away on its own. The background tick snapshots it
+            // when it closes a dead browser; a live browser about to be
+            // relaunched for a settings change reads it from the manager
+            // before the patch closes it. A blank tab restores to nothing.
+            let lost_url = state
+                .last_active_url
+                .clone()
+                .or_else(|| state.browser.as_ref().and_then(|mgr| mgr.active_page_url()))
+                .filter(|url| url != "about:blank");
+            let browser_was_lost = state.browser_exited;
+            // A fresh daemon resuming a session has no live browser and no
+            // exit record of its own; the persisted tab binding is the only
+            // trace that the session had a page.
+            let binding_url = if lost_url.is_none() && !state.had_browser {
+                tab_binding::load(&state.session_id)
+                    .ok()
+                    .flatten()
+                    .map(|b| b.url)
+                    .filter(|url| !url.is_empty() && url != "about:blank")
+            } else {
+                None
+            };
+            let had_binding_url = binding_url.is_some();
+            let restore_url = lost_url.or(binding_url);
             // Past the policy gates: the launch settings take effect now.
             if let (Some(patch), Some(_)) = (launch_patch.as_ref(), launch_plan.as_ref()) {
                 match apply_settings_patch(state, patch, true).await {
@@ -3401,7 +3458,65 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             )
             .await;
             let launched = match launched {
-                Ok(_) => Box::pin(start_flow_capture(state)).await,
+                Ok(_) => {
+                    // The browser this command replaces went away on its own,
+                    // not by a settings change: either the tick saw its process
+                    // exit, or a previous daemon is gone and only its binding
+                    // is left. A settings change that relaunches a live browser
+                    // is already reported by the patch outcome, so it needs no
+                    // entry of its own here. Only a browser agent-browser
+                    // launched itself counts: attaching to an external browser
+                    // is a switch, not a relaunch.
+                    let new_browser_local = state
+                        .browser
+                        .as_ref()
+                        .is_some_and(|mgr| !mgr.is_cdp_connection())
+                        && state.active_provider_session.is_none()
+                        && state.webdriver_backend.is_none();
+                    let replaces_lost_browser =
+                        (browser_was_lost || had_binding_url) && new_browser_local;
+                    lifecycle_relaunched_browser |= replaces_lost_browser;
+                    // The new browser starts on about:blank; put the page
+                    // back when one was lost, so the command reads the page
+                    // the session was showing instead of a blank tab. A
+                    // navigate command brings its own URL and skips this.
+                    // Best effort: a failed restore warns instead of failing
+                    // the command, and the relaunch is still reported.
+                    let restore = match &restore_url {
+                        Some(url) if action != "navigate" => restore_lost_page(state, url).await,
+                        _ => None,
+                    };
+                    if replaces_lost_browser {
+                        settings_outcome.changes.push(json!({
+                            "option": "browser",
+                            "requested": restore_url.as_deref().map(Value::from).unwrap_or(Value::Null),
+                            "running": Value::Null,
+                            "effect": "relaunch",
+                            "applied": true,
+                            "reason": "browser exited",
+                        }));
+                        let page = restore_url.as_deref().unwrap_or("the previous page");
+                        relaunch_report = Some(match &restore {
+                            Some(Ok(())) => format!(
+                                "The previous browser was gone, so this command launched a new one and restored {}.",
+                                page
+                            ),
+                            Some(Err(e)) => format!(
+                                "The previous browser was gone, so this command launched a new one but could not restore {}: {}.",
+                                page, e
+                            ),
+                            None => "The previous browser was gone, so this command launched a new one."
+                                .to_string(),
+                        });
+                    } else if let Some(Err(e)) = &restore {
+                        let page = restore_url.as_deref().unwrap_or("the previous page");
+                        relaunch_report = Some(format!(
+                            "This command relaunched the browser but could not restore {}: {}.",
+                            page, e
+                        ));
+                    }
+                    Box::pin(start_flow_capture(state)).await
+                }
                 Err(e) => Err(e),
             };
             if let Err(e) = launched {
@@ -3796,6 +3911,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         lifecycle_relaunched_browser,
     );
     attach_settings_outcome(&mut resp, &settings_outcome);
+    if let Some(report) = &relaunch_report {
+        append_warning(&mut resp, report);
+    }
 
     // Re-drain so a dialog opened by THIS command is reflected in the warning
     // below; events are otherwise only drained at the start of a command.
@@ -3810,6 +3928,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             lifecycle_relaunched_browser,
         );
         attach_settings_outcome(&mut resp, &settings_outcome);
+        if let Some(report) = &relaunch_report {
+            append_warning(&mut resp, report);
+        }
     }
     attach_webmcp_availability(&mut resp, action, state).await;
     attach_flow_availability(&mut resp, action, state).await;
@@ -4684,13 +4805,21 @@ async fn auto_launch_with(
     if state.attached_target.is_some() && cmd.is_null() {
         // Resume the attached browser; the launch handler resolves the target.
         let launch = json!({ "action": "launch", "plugins": plugins });
-        return Box::pin(handle_launch(&launch, state)).await;
+        let result = Box::pin(handle_launch(&launch, state)).await;
+        if result.is_ok() {
+            state.note_browser_acquired();
+        }
+        return result;
     }
     let connection = state.settings.connection();
     if matches!(connection, Connection::Cdp(_) | Connection::AutoConnect)
         || !matches!(&connection, Connection::Provider(provider) if provider_is_browser_use(provider))
     {
-        return auto_launch_inner(state, plugins, cmd, strict_state).await;
+        let result = auto_launch_inner(state, plugins, cmd, strict_state).await;
+        if result.is_ok() {
+            state.note_browser_acquired();
+        }
+        return result;
     }
     let credentials = state.proxy_credentials.read().await.clone();
     let scripts = state.plugin_init_scripts.clone();
@@ -4708,6 +4837,8 @@ async fn auto_launch_with(
         *state.proxy_credentials.write().await = credentials;
         state.plugin_init_scripts = scripts;
         state.session_setup = setup;
+    } else {
+        state.note_browser_acquired();
     }
     result
 }
@@ -6251,6 +6382,29 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     navigate_active_page(state, url, wait_until).await
 }
 
+/// Navigate a freshly relaunched browser back to the page the session was
+/// showing before its browser went away, so an implicit relaunch does not
+/// silently land on about:blank. Only for a browser agent-browser launched
+/// itself; an attached, auto-connected, or provider browser keeps whatever
+/// tab it has. Returns `None` when there is nothing local to restore,
+/// `Some(Ok(()))` when the page is back, and `Some(Err(_))` when the
+/// navigation failed; the caller warns instead of failing the command.
+async fn restore_lost_page(state: &mut DaemonState, url: &str) -> Option<Result<(), String>> {
+    let local = state
+        .browser
+        .as_ref()
+        .is_some_and(|mgr| !mgr.is_cdp_connection())
+        && state.active_provider_session.is_none()
+        && state.webdriver_backend.is_none();
+    if !local {
+        return None;
+    }
+    match navigate_active_page(state, url, WaitUntil::Load).await {
+        Ok(_) => Some(Ok(())),
+        Err(e) => Some(Err(e)),
+    }
+}
+
 /// Navigate the active page and drop element refs and frame scope. Every
 /// command that replaces the active document must go through here, or a
 /// stale `@e3` from the previous page keeps resolving. WebMCP page state is
@@ -6491,6 +6645,18 @@ async fn close_session(state: &mut DaemonState, forget_settings: bool) -> Result
     let save_result = auto_save_restore_state(state).await;
     close_all_browser_backends(state).await?;
     state.attached_target = None;
+
+    // An explicit close ends the session on purpose: the next launch starts
+    // fresh instead of restoring the page a browser that died earlier was
+    // showing. The binding is cleared with it, so a daemon restart after a
+    // close does not resurrect the page either; the daemon restarts the CLI
+    // asks for (forget_settings false) keep the binding and resume the tab.
+    state.browser_exited = false;
+    state.last_active_url = None;
+    if forget_settings {
+        tab_binding::clear(&state.session_id);
+        state.last_persisted_binding = None;
+    }
 
     // Stop background Fetch handler
     if let Some(task) = state.fetch_handler_task.take() {

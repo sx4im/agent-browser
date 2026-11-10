@@ -2506,6 +2506,17 @@ impl BrowserManager {
             .map(|p| (p.target_id.clone(), p.url.clone()))
     }
 
+    /// The active page's last known URL from the in-memory page list, without
+    /// a CDP round trip. Unlike `binding_snapshot` this stays available after
+    /// the browser process exits, so a relaunch can restore the page the
+    /// session was showing instead of landing on about:blank.
+    pub fn active_page_url(&self) -> Option<String> {
+        self.pages
+            .get(self.active_page_index)
+            .map(|p| p.url.clone())
+            .filter(|url| !url.is_empty())
+    }
+
     pub fn update_page_target_info(&mut self, target: &TargetInfo) -> bool {
         update_page_target_info_in_pages(&mut self.pages, target)
     }
