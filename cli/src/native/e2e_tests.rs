@@ -14836,6 +14836,49 @@ async fn e2e_dialog_blocked_tab_is_not_treated_as_wedged() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_auto_dialog_dismisses_alert() {
+    // Regression test for #2511: under the default auto-dialog handling an
+    // alert() must be dismissed by the background handler, so the eval
+    // returns promptly and the tab is not treated as wedged.
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true, "args": ["--no-sandbox", "--disable-dev-shm-usage"] }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": "data:text/html,<title>live</title>live" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let started = std::time::Instant::now();
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "evaluate", "script": "alert(1); 'after-alert'" }),
+        &mut state,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "after-alert");
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "auto-dismiss took too long: {:?}",
+        elapsed
+    );
+
+    let resp = execute_command(&json!({ "id": "4", "action": "title" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["title"], "live");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_slow_finite_script_keeps_its_tab() {
     let mut state = DaemonState::new();
     let resp = execute_command(

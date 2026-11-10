@@ -661,6 +661,11 @@ pub struct DaemonState {
     pub input_mode: String,
     /// Tracks the currently open JavaScript dialog (alert/confirm/prompt), if any.
     pub pending_dialog: Option<PendingDialog>,
+    /// An alert/beforeunload dialog the background auto-dismiss task is
+    /// supposed to clear. Tracked separately from `pending_dialog` so a
+    /// stuck auto-dismiss is visible to the timeout path, the dialog guard,
+    /// and `dialog status` instead of being mistaken for a wedge.
+    pub auto_dialog_pending: Option<PendingDialog>,
     /// A `page_wedged` report whose response may not have reached the client,
     /// keyed by the request id. The client's read timeout can expire before
     /// the daemon finishes replacing the tab, so a retry of the same request
@@ -844,6 +849,7 @@ impl DaemonState {
             mouse_state: MouseState::default(),
             input_mode: "instant".to_string(),
             pending_dialog: None,
+            auto_dialog_pending: None,
             undelivered_wedge: None,
             pending_pointer_release: None,
             stream_client: None,
@@ -1141,6 +1147,16 @@ impl DaemonState {
     /// Start the background task that auto-accepts `alert` and `beforeunload`
     /// dialogs so they never block the agent. `confirm` and `prompt` dialogs
     /// are left for the agent to handle explicitly.
+    /// Session of the dialog currently blocking the page, if any, whether it
+    /// waits on the agent or the auto-dismiss task failed to clear it.
+    /// Browser-side operations use it to skip renderer probes on a blocked tab.
+    fn blocking_dialog_session(&self) -> Option<String> {
+        self.pending_dialog
+            .as_ref()
+            .or(self.auto_dialog_pending.as_ref())
+            .and_then(|d| d.session_id.clone())
+    }
+
     fn start_dialog_handler(&mut self) {
         if let Some(task) = self.dialog_handler_task.take() {
             task.abort();
@@ -2262,25 +2278,32 @@ impl DaemonState {
                             {
                                 // When auto_dialog is enabled, alert and beforeunload
                                 // dialogs are handled by the background dialog_handler_task.
-                                // Skip tracking them to avoid a stale warning.
+                                // Track them separately: a dialog the task fails to
+                                // dismiss is stuck, and the timeout path, dialog
+                                // guard, and `dialog status` need to see it instead
+                                // of mistaking it for a wedge.
                                 let auto_handled = self.auto_dialog
                                     && matches!(
                                         dialog_event.dialog_type.as_str(),
                                         "beforeunload" | "alert"
                                     );
-                                if !auto_handled {
-                                    self.pending_dialog = Some(PendingDialog {
-                                        dialog_type: dialog_event.dialog_type,
-                                        message: dialog_event.message,
-                                        url: dialog_event.url,
-                                        default_prompt: dialog_event.default_prompt,
-                                        session_id: event.session_id.clone(),
-                                    });
+                                let dialog = PendingDialog {
+                                    dialog_type: dialog_event.dialog_type,
+                                    message: dialog_event.message,
+                                    url: dialog_event.url,
+                                    default_prompt: dialog_event.default_prompt,
+                                    session_id: event.session_id.clone(),
+                                };
+                                if auto_handled {
+                                    self.auto_dialog_pending = Some(dialog);
+                                } else {
+                                    self.pending_dialog = Some(dialog);
                                 }
                             }
                         }
                         "Page.javascriptDialogClosed" => {
                             self.pending_dialog = None;
+                            self.auto_dialog_pending = None;
                         }
                         // Fetch.requestPaused is handled by the background
                         // fetch_handler_task — no need to collect here.
@@ -3449,13 +3472,21 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         return resp;
     }
 
-    // A pending confirm/prompt dialog blocks the renderer's main thread, so
-    // any command that touches the page would hang until the client read
-    // timeout. Fail fast with instructions instead. Actions in skip_launch
-    // never touch the page; dialog/screenshot/url/title are browser-side.
+    // A pending JavaScript dialog blocks the renderer's main thread, so any
+    // command that touches the page would hang until the client read
+    // timeout. Fail fast with instructions instead. This covers both a
+    // dialog waiting on the agent and one the auto-dismiss task failed to
+    // clear. Actions in skip_launch never touch the page; dialog/screenshot
+    // are browser-side. url/title look browser-side but read through
+    // Runtime.evaluate, so they hang like any page command while a dialog
+    // is open.
     // Only a dialog on the ACTIVE tab blocks: one on a background tab leaves
     // the active tab's renderer responsive.
-    if let Some(ref dialog) = state.pending_dialog {
+    if let Some(ref dialog) = state
+        .pending_dialog
+        .as_ref()
+        .or(state.auto_dialog_pending.as_ref())
+    {
         let active_session = state
             .browser
             .as_ref()
@@ -3477,14 +3508,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         let safe_during_dialog = (skip_launch && !read_touches_active_tab)
             || matches!(
                 action,
-                "dialog"
-                    | "screenshot"
-                    | "url"
-                    | "title"
-                    | "tab_list"
-                    | "tab_new"
-                    | "tab_switch"
-                    | "tab_close"
+                "dialog" | "screenshot" | "tab_list" | "tab_new" | "tab_switch" | "tab_close"
             );
         if on_active_tab && !safe_during_dialog {
             let mut resp = error_response(
@@ -3719,10 +3743,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             // A dialog opened by this command blocks the renderer like a
             // wedge does; its event is only seen once events are drained.
             let _ = state.drain_cdp_events_background().await;
-            let dialog_session = state
-                .pending_dialog
-                .as_ref()
-                .and_then(|d| d.session_id.clone());
+            let dialog_session = state.blocking_dialog_session();
             let may_replace = may_replace_wedged_tab(state);
             if let Some(mgr) = state.browser.as_mut() {
                 wedge = mgr
@@ -3816,7 +3837,11 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
 
     // Auto-report pending JavaScript dialog so agents know why commands may hang
     if action != "dialog" {
-        if let Some(ref dialog) = state.pending_dialog {
+        if let Some(ref dialog) = state
+            .pending_dialog
+            .as_ref()
+            .or(state.auto_dialog_pending.as_ref())
+        {
             append_warning(
                 &mut resp,
                 &format!(
@@ -5232,7 +5257,7 @@ fn autosave_due(state: &DaemonState, interval_ms: u64) -> bool {
     }
     // A JS dialog blocks the renderer's main thread, so the storage-collection
     // evaluate would hang until its CDP timeout. Wait for the dialog instead.
-    if state.pending_dialog.is_some() {
+    if state.pending_dialog.is_some() || state.auto_dialog_pending.is_some() {
         return false;
     }
     let now = std::time::Instant::now();
@@ -5923,6 +5948,10 @@ async fn apply_settings_patch(
     }
     if was(Key::NoAutoDialog) {
         state.auto_dialog = !next.no_auto_dialog();
+        // The handler task follows the flag: re-enabling mid-session starts
+        // it, disabling aborts it. start_dialog_handler is idempotent and
+        // no-ops when auto_dialog is false or no browser is attached.
+        state.start_dialog_handler();
     }
     if was(Key::ActionPolicy) || was(Key::ConfirmActions) || was(Key::AllowedDomains) {
         // An approval asked for under the old rules no longer stands.
@@ -8462,10 +8491,7 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
             ));
         }
     }
-    let dialog_session = state
-        .pending_dialog
-        .as_ref()
-        .and_then(|d| d.session_id.clone());
+    let dialog_session = state.blocking_dialog_session();
     let result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
         mgr.tab_switch_by_id(tab_id, dialog_session.as_deref())
@@ -8520,10 +8546,7 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
             None => None,
         }
     };
-    let dialog_session = state
-        .pending_dialog
-        .as_ref()
-        .and_then(|d| d.session_id.clone());
+    let dialog_session = state.blocking_dialog_session();
     let result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
         mgr.tab_close_by_id(tab_id, dialog_session.as_deref())
@@ -9431,20 +9454,26 @@ async fn handle_dialog(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     // dialog status — return pending dialog info
     if response == Some("status") {
-        return Ok(match &state.pending_dialog {
-            Some(dialog) => {
-                let mut obj = json!({
-                    "hasDialog": true,
-                    "type": dialog.dialog_type,
-                    "message": dialog.message,
-                });
-                if let Some(ref prompt) = dialog.default_prompt {
-                    obj["defaultPrompt"] = json!(prompt);
+        return Ok(
+            match state
+                .pending_dialog
+                .as_ref()
+                .or(state.auto_dialog_pending.as_ref())
+            {
+                Some(dialog) => {
+                    let mut obj = json!({
+                        "hasDialog": true,
+                        "type": dialog.dialog_type,
+                        "message": dialog.message,
+                    });
+                    if let Some(ref prompt) = dialog.default_prompt {
+                        obj["defaultPrompt"] = json!(prompt);
+                    }
+                    obj
                 }
-                obj
-            }
-            None => json!({ "hasDialog": false }),
-        });
+                None => json!({ "hasDialog": false }),
+            },
+        );
     }
 
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
@@ -9459,6 +9488,7 @@ async fn handle_dialog(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     // pending_dialog would make every page command fail fast forever.
     let result = mgr.handle_dialog(accept, prompt_text).await;
     state.pending_dialog = None;
+    state.auto_dialog_pending = None;
     result?;
 
     // If a click's mousedown opened this dialog, the button is still logically
@@ -22099,6 +22129,49 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             let auto_handled = auto_dialog && matches!(*dialog_type, "beforeunload" | "alert");
             assert!(!auto_handled, "{dialog_type} should NOT be auto-handled");
         }
+    }
+
+    #[test]
+    fn drain_tracks_stuck_auto_handled_alert_separately() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_NO_AUTO_DIALOG"]);
+        std::env::remove_var("AGENT_BROWSER_NO_AUTO_DIALOG");
+        let mut state = DaemonState::new();
+        let (events, receiver) = broadcast::channel(16);
+        state.event_rx = Some(receiver);
+
+        // An alert under auto_dialog populates auto_dialog_pending, never
+        // pending_dialog, so the timeout path can tell it from a wedge.
+        events
+            .send(CdpEvent {
+                method: "Page.javascriptDialogOpening".to_string(),
+                params: json!({"type": "alert", "message": "stuck?", "url": "https://example.com"}),
+                session_id: Some("sess-1".to_string()),
+            })
+            .unwrap();
+        let _ = state.drain_cdp_events();
+        assert!(state.pending_dialog.is_none());
+        let auto = state
+            .auto_dialog_pending
+            .as_ref()
+            .expect("auto-handled alert is tracked");
+        assert_eq!(auto.dialog_type, "alert");
+        assert_eq!(auto.message, "stuck?");
+        assert_eq!(auto.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(state.blocking_dialog_session().as_deref(), Some("sess-1"));
+        assert!(!autosave_due(&state, 30_000));
+
+        events
+            .send(CdpEvent {
+                method: "Page.javascriptDialogClosed".to_string(),
+                params: json!({}),
+                session_id: Some("sess-1".to_string()),
+            })
+            .unwrap();
+        let _ = state.drain_cdp_events();
+        assert!(state.auto_dialog_pending.is_none());
+        assert!(state.blocking_dialog_session().is_none());
+        assert!(autosave_due(&state, 30_000));
+        drop(guard);
     }
     // === Session settings applied from a patch ===
 
