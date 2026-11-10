@@ -3452,7 +3452,10 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
     // A pending confirm/prompt dialog blocks the renderer's main thread, so
     // any command that touches the page would hang until the client read
     // timeout. Fail fast with instructions instead. Actions in skip_launch
-    // never touch the page; dialog/screenshot/url/title are browser-side.
+    // never touch the page; dialog/screenshot/tab management are browser-side.
+    // Note url/title are NOT safe: both read through Runtime.evaluate on the
+    // page, which never answers while a modal dialog blocks the renderer, so
+    // they hang for the full read timeout instead of failing fast (#2511).
     // Only a dialog on the ACTIVE tab blocks: one on a background tab leaves
     // the active tab's renderer responsive.
     if let Some(ref dialog) = state.pending_dialog {
@@ -3477,14 +3480,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         let safe_during_dialog = (skip_launch && !read_touches_active_tab)
             || matches!(
                 action,
-                "dialog"
-                    | "screenshot"
-                    | "url"
-                    | "title"
-                    | "tab_list"
-                    | "tab_new"
-                    | "tab_switch"
-                    | "tab_close"
+                "dialog" | "screenshot" | "tab_list" | "tab_new" | "tab_switch" | "tab_close"
             );
         if on_active_tab && !safe_during_dialog {
             let mut resp = error_response(
@@ -5923,6 +5919,14 @@ async fn apply_settings_patch(
     }
     if was(Key::NoAutoDialog) {
         state.auto_dialog = !next.no_auto_dialog();
+        // The flag alone does not start or stop the background task that
+        // dismisses alert/beforeunload dialogs: without this, a session
+        // that re-enables auto-dialog after starting with --no-auto-dialog
+        // would keep wedging on every alert (#2511). Restarting the
+        // handler covers both directions: it aborts the old task, then
+        // returns early when auto-dialog is off and spawns a fresh task
+        // subscribed to the current browser client when it is on.
+        state.start_dialog_handler();
     }
     if was(Key::ActionPolicy) || was(Key::ConfirmActions) || was(Key::AllowedDomains) {
         // An approval asked for under the old rules no longer stands.

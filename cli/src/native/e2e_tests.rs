@@ -14836,6 +14836,105 @@ async fn e2e_dialog_blocked_tab_is_not_treated_as_wedged() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_alert_auto_dismissed_by_default() {
+    let mut state = DaemonState::new();
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": "data:text/html,<title>live</title>live" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // alert() must be auto-accepted: the eval returns promptly with the
+    // value after the alert instead of hanging until the CDP timeout, and
+    // the tab keeps working (#2511).
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "evaluate", "script": "alert(1); 'after-alert'" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["result"], "after-alert");
+
+    let resp = execute_command(&json!({ "id": "4", "action": "title" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["title"], "live");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_dialog_open_fails_fast_for_title() {
+    let mut state = DaemonState::new();
+    // Model --no-auto-dialog: alert() is tracked instead of auto-dismissed.
+    state.auto_dialog = false;
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": "data:text/html,<title>live</title>live" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // The triggering eval hangs until the CDP timeout (the dialog opens
+    // during the eval), but it must not be treated as a wedge.
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "evaluate", "script": "alert(1)" }),
+        &mut state,
+    )
+    .await;
+    assert_ne!(
+        resp["code"], "page_wedged",
+        "a dialog is not a wedge: {}",
+        resp
+    );
+    // A title read while the dialog is open must fail fast with the dialog
+    // hint instead of hanging until the CDP timeout (#2511).
+    let resp = execute_command(&json!({ "id": "4", "action": "title" }), &mut state).await;
+    assert_eq!(
+        resp.get("success").and_then(Value::as_bool),
+        Some(false),
+        "title during a dialog must fail fast, got: {}",
+        serde_json::to_string_pretty(&resp).unwrap_or_default()
+    );
+    assert!(
+        resp["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("dialog is blocking"),
+        "title error must name the blocking dialog, got: {}",
+        serde_json::to_string_pretty(&resp).unwrap_or_default()
+    );
+
+    let resp = execute_command(
+        &json!({ "id": "5", "action": "dialog", "response": "dismiss" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let resp = execute_command(&json!({ "id": "6", "action": "title" }), &mut state).await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["title"], "live");
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_slow_finite_script_keeps_its_tab() {
     let mut state = DaemonState::new();
     let resp = execute_command(
