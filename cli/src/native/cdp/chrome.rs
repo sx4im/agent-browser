@@ -438,6 +438,11 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         "NetworkServiceInProcess".to_string(),
     ];
     if options.webmcp {
+        // Chromium 157 removed the WebMCPTesting legacy feature, so the
+        // WebMCP feature itself must be enabled for document.modelContext
+        // to exist (issue #2513). Keep the legacy flags for older managed
+        // Chrome builds, where WebMCPTesting still implies WebMCP.
+        enable_features.push("WebMCP".to_string());
         enable_features.push("WebMCPTesting".to_string());
         enable_features.push("DevToolsWebMCPSupport".to_string());
     }
@@ -1874,6 +1879,21 @@ mod tests {
     use super::*;
     use crate::test_utils::EnvGuard;
 
+    /// The exact feature names in the single --enable-features switch.
+    /// Splitting on commas avoids substring false positives ("WebMCP"
+    /// is a substring of "WebMCPTesting").
+    fn enabled_features(args: &ChromeArgs) -> Vec<String> {
+        let flag = args
+            .args
+            .iter()
+            .find(|arg| arg.starts_with("--enable-features="))
+            .expect("expected a single --enable-features switch");
+        flag["--enable-features=".len()..]
+            .split(',')
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
     fn test_dev_shm_capacity_threshold() {
         assert!(dev_shm_is_too_small(64 * 1024 * 1024));
@@ -2476,13 +2496,13 @@ exec sleep 60
     #[test]
     fn test_build_args_enables_webmcp_by_default() {
         let result = build_chrome_args(&LaunchOptions::default()).unwrap();
-        let features = result
-            .args
-            .iter()
-            .find(|arg| arg.starts_with("--enable-features="))
-            .unwrap();
-        assert!(features.contains("WebMCPTesting"));
-        assert!(features.contains("DevToolsWebMCPSupport"));
+        let features = enabled_features(&result);
+        // Chromium 157 removed WebMCPTesting, so the WebMCP feature itself
+        // must be enabled for document.modelContext to exist (issue #2513).
+        // The legacy flags stay for older managed Chrome builds.
+        assert!(features.contains(&"WebMCP".to_string()));
+        assert!(features.contains(&"WebMCPTesting".to_string()));
+        assert!(features.contains(&"DevToolsWebMCPSupport".to_string()));
     }
 
     #[test]
@@ -2492,13 +2512,10 @@ exec sleep 60
             ..Default::default()
         })
         .unwrap();
-        let features = result
-            .args
-            .iter()
-            .find(|arg| arg.starts_with("--enable-features="))
-            .unwrap();
-        assert!(!features.contains("WebMCPTesting"));
-        assert!(!features.contains("DevToolsWebMCPSupport"));
+        let features = enabled_features(&result);
+        assert!(!features.contains(&"WebMCP".to_string()));
+        assert!(!features.contains(&"WebMCPTesting".to_string()));
+        assert!(!features.contains(&"DevToolsWebMCPSupport".to_string()));
     }
 
     #[test]
