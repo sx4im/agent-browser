@@ -3906,6 +3906,73 @@ async fn e2e_press_dispatches_single_keystroke() {
     assert_success(&resp);
 }
 
+/// `press` must return only after the page has run the macrotasks the keys
+/// queued, or a click issued right after the keys can arrive before a
+/// `setTimeout(0)` the keys scheduled has fired (e.g. MUI's
+/// ClickAwayListener, which arms itself on such a timer). The guard here
+/// arms one macrotask after heavy follow-up work the keypress queued, like
+/// a React render; without the settle, the outside click lands while the
+/// guard is still unarmed and is ignored.
+#[tokio::test]
+#[ignore]
+async fn e2e_press_settles_queued_macrotasks_before_returning() {
+    let mut state = DaemonState::new();
+
+    let resp = execute_command(
+        &json!({ "id": "1", "action": "launch", "headless": true, "args": ["--no-sandbox", "--disable-dev-shm-usage"] }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let html = r#"<!doctype html><html><body>
+<input id="ed">
+<button id="outside">outside</button>
+<script>
+window.__armed = false;
+window.__closed = false;
+addEventListener('keydown', () => {
+  setTimeout(() => {
+    const end = Date.now() + 250;
+    while (Date.now() < end) {}
+    setTimeout(() => { window.__armed = true; }, 0);
+  }, 0);
+}, { once: true });
+document.getElementById('outside').addEventListener('click', () => {
+  if (window.__armed) { window.__closed = true; }
+});
+</script>
+</body></html>"#;
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(html));
+    let resp = execute_command(
+        &json!({ "id": "2", "action": "navigate", "url": url }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    let resp = execute_command(
+        &json!({ "id": "3", "action": "press", "key": "a" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    // No pause here: if `press` returned before the queued macrotasks ran,
+    // this click lands while the guard is still unarmed and is ignored.
+    let resp = execute_command(
+        &json!({ "id": "4", "action": "click", "selector": "#outside" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+
+    assert_evaluate(&mut state, "5", "window.__closed", json!(true)).await;
+
+    let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
+    assert_success(&resp);
+}
+
 // ---------------------------------------------------------------------------
 // Raw mouse regressions
 // ---------------------------------------------------------------------------
