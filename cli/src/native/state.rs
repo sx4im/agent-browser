@@ -462,7 +462,7 @@ pub fn validate_state_file(path: &str) -> Result<(), String> {
 
 /// Restore cookies and per-origin storage from a state file.
 ///
-/// Storage is written through CDP DOMStorage, so no page script sees the values and Chrome only accepts the write when a frame is at the saved origin. Origins that redirect elsewhere or fail to load are skipped and returned.
+/// Storage is written through CDP DOMStorage, so no page script sees the values and Chrome only accepts the write when a frame is at the saved origin. Engines without the DOMStorage domain (Lightpanda) fall back to writing through page JavaScript once the tab is on the saved origin, and the write is verified by reading the values back. Origins that redirect elsewhere or fail to load are skipped and returned.
 pub async fn load_state(
     client: &CdpClient,
     session_id: &str,
@@ -498,26 +498,171 @@ pub async fn load_state(
     Ok(skipped)
 }
 
-async fn restore_origin_storage(
+/// Evaluate a JS expression in the page and return its value. Unlike
+/// `eval_origin_storage`, a thrown exception is surfaced as an error
+/// instead of silently producing no value.
+async fn eval_value(
     client: &CdpClient,
     session_id: &str,
-    origin: &OriginStorage,
-) -> Result<(), String> {
-    let security_origin = url::Url::parse(&origin.origin)
-        .ok()
-        .map(|u| u.origin())
-        .filter(|o| o.is_tuple())
-        .map(|o| o.ascii_serialization())
-        .unwrap_or_else(|| origin.origin.trim_end_matches('/').to_string());
-    client
-        .send_command(
-            "Page.navigate",
-            Some(json!({ "url": format!("{}/", security_origin) })),
+    expression: &str,
+) -> Result<Value, String> {
+    let result = client
+        .send_command_typed::<_, super::cdp::types::EvaluateResult>(
+            "Runtime.evaluate",
+            &EvaluateParams {
+                expression: expression.to_string(),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
             Some(session_id),
         )
         .await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    if let Some(exception) = result.exception_details {
+        return Err(format!("JavaScript evaluation failed: {}", exception.text));
+    }
+    Ok(result.result.value.unwrap_or(Value::Null))
+}
 
+/// Wait until the tab reports `location.origin` equal to `origin`, polling
+/// every 100ms for up to 5s. The fixed 500ms sleep this replaces was a race:
+/// a slow navigation left the restore writing to the previous page's origin
+/// (or about:blank, where storage access throws), so the origin was
+/// silently skipped.
+async fn wait_for_origin(client: &CdpClient, session_id: &str, origin: &str) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        if let Ok(current) = eval_value(client, session_id, "location.origin").await {
+            if current.as_str() == Some(origin) {
+                return Ok(());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for page to reach origin {}",
+                origin
+            ));
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// One `[isLocalStorage, key, value]` triple per entry, local entries first.
+/// The JSON is embedded verbatim as a JavaScript array literal in the
+/// restore snippets; `serde_json` escaping keeps quotes, backslashes and
+/// newlines inside keys and values from breaking out of the snippet.
+fn storage_write_entries_json(origin: &OriginStorage) -> String {
+    let entries: Vec<(bool, &str, &str)> = origin
+        .local_storage
+        .iter()
+        .map(|e| (true, e.name.as_str(), e.value.as_str()))
+        .chain(
+            origin
+                .session_storage
+                .iter()
+                .map(|e| (false, e.name.as_str(), e.value.as_str())),
+        )
+        .collect();
+    serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Page-script restore for one origin: writes every entry with
+/// `localStorage.setItem` / `sessionStorage.setItem` and returns how many
+/// entries were written.
+fn storage_write_js(origin: &OriginStorage) -> String {
+    format!(
+        r#"(() => {{
+            const entries = {};
+            for (const [isLocal, key, value] of entries) {{
+                (isLocal ? localStorage : sessionStorage).setItem(key, value);
+            }}
+            return entries.length;
+        }})()"#,
+        storage_write_entries_json(origin)
+    )
+}
+
+/// Page-script read-back for one origin: returns one
+/// `[isLocalStorage, key, value]` triple per entry, with `null` for a
+/// missing key.
+fn storage_verify_js(origin: &OriginStorage) -> String {
+    let keys: Vec<(bool, &str)> = origin
+        .local_storage
+        .iter()
+        .map(|e| (true, e.name.as_str()))
+        .chain(
+            origin
+                .session_storage
+                .iter()
+                .map(|e| (false, e.name.as_str())),
+        )
+        .collect();
+    let json = serde_json::to_string(&keys).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        r#"(() => {{
+            const keys = {};
+            const out = [];
+            for (const [isLocal, key] of keys) {{
+                out.push([isLocal, key, (isLocal ? localStorage : sessionStorage).getItem(key)]);
+            }}
+            return out;
+        }})()"#,
+        json
+    )
+}
+
+/// Compare read-back storage values against the saved entries. `values` is
+/// the array the verify snippet returns: one `[isLocalStorage, key, value]`
+/// triple per entry, with `null` for a missing key.
+fn verify_storage_values(origin: &OriginStorage, values: &Value) -> Result<(), String> {
+    let triples = values.as_array().ok_or_else(|| {
+        format!(
+            "storage restore verification failed for origin {}: unexpected response",
+            origin.origin
+        )
+    })?;
+    let expected: Vec<(bool, &str, &str)> = origin
+        .local_storage
+        .iter()
+        .map(|e| (true, e.name.as_str(), e.value.as_str()))
+        .chain(
+            origin
+                .session_storage
+                .iter()
+                .map(|e| (false, e.name.as_str(), e.value.as_str())),
+        )
+        .collect();
+    if triples.len() != expected.len() {
+        return Err(format!(
+            "storage restore verification failed for origin {}: expected {} entries, read back {}",
+            origin.origin,
+            expected.len(),
+            triples.len()
+        ));
+    }
+    for ((is_local, name, value), triple) in expected.iter().zip(triples.iter()) {
+        let read_local = triple.get(0).and_then(|v| v.as_bool());
+        let read_key = triple.get(1).and_then(|v| v.as_str());
+        let read_value = triple.get(2).and_then(|v| v.as_str());
+        if read_local != Some(*is_local) || read_key != Some(*name) || read_value != Some(*value) {
+            return Err(format!(
+                "storage restore verification failed for origin {}: key '{}' was not restored",
+                origin.origin, name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Write one origin's storage through the DOMStorage CDP domain and verify
+/// the values landed by reading them back. The read-back matters: a browser
+/// that acknowledges an unimplemented method without writing anything must
+/// not report success.
+async fn restore_via_dom_storage(
+    client: &CdpClient,
+    session_id: &str,
+    security_origin: &str,
+    origin: &OriginStorage,
+) -> Result<(), String> {
     let entries = origin
         .local_storage
         .iter()
@@ -539,7 +684,67 @@ async fn restore_origin_storage(
             )
             .await?;
     }
-    Ok(())
+    let read_back = eval_value(client, session_id, &storage_verify_js(origin)).await?;
+    verify_storage_values(origin, &read_back)
+}
+
+/// Write one origin's storage through page JavaScript and verify the values
+/// landed. Used when the browser has no DOMStorage CDP domain (Lightpanda
+/// implements Page, Runtime, Network and Fetch but not DOMStorage), where
+/// the DOMStorage write fails with an unknown-method error and the origin
+/// would otherwise be silently skipped.
+async fn restore_via_page_script(
+    client: &CdpClient,
+    session_id: &str,
+    origin: &OriginStorage,
+) -> Result<(), String> {
+    let written = eval_value(client, session_id, &storage_write_js(origin)).await?;
+    let expected = (origin.local_storage.len() + origin.session_storage.len()) as u64;
+    if written.as_u64() != Some(expected) {
+        return Err(format!(
+            "page-script storage restore for origin {} wrote {} of {} entries",
+            origin.origin,
+            written.as_u64().unwrap_or(0),
+            expected
+        ));
+    }
+    let read_back = eval_value(client, session_id, &storage_verify_js(origin)).await?;
+    verify_storage_values(origin, &read_back)
+}
+
+async fn restore_origin_storage(
+    client: &CdpClient,
+    session_id: &str,
+    origin: &OriginStorage,
+) -> Result<(), String> {
+    let security_origin = url::Url::parse(&origin.origin)
+        .ok()
+        .map(|u| u.origin())
+        .filter(|o| o.is_tuple())
+        .map(|o| o.ascii_serialization())
+        .unwrap_or_else(|| origin.origin.trim_end_matches('/').to_string());
+    client
+        .send_command(
+            "Page.navigate",
+            Some(json!({ "url": format!("{}/", security_origin) })),
+            Some(session_id),
+        )
+        .await?;
+    // Wait for the navigation to commit: writing before the tab reaches the
+    // saved origin stores the values under the wrong origin or throws on
+    // about:blank.
+    wait_for_origin(client, session_id, &security_origin).await?;
+
+    // Preferred path: the DOMStorage domain writes without page JavaScript
+    // ever seeing the values.
+    if restore_via_dom_storage(client, session_id, &security_origin, origin)
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    // Fallback for engines without the DOMStorage domain (Lightpanda).
+    restore_via_page_script(client, session_id, origin).await
 }
 
 fn is_state_file(path: &std::path::Path) -> bool {
@@ -1062,5 +1267,125 @@ mod tests {
         let result = dispatch_state_command(&cmd).unwrap();
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Missing 'name' parameter");
+    }
+
+    fn restore_test_origin() -> OriginStorage {
+        OriginStorage {
+            origin: "http://127.0.0.1:8765".to_string(),
+            local_storage: vec![
+                StorageEntry {
+                    name: "persistence-test".to_string(),
+                    value: "LP_RESTORE_OK".to_string(),
+                },
+                StorageEntry {
+                    name: "tricky\"key\\with\nnewline".to_string(),
+                    value: "val</script>✓".to_string(),
+                },
+            ],
+            session_storage: vec![StorageEntry {
+                name: "tab-state".to_string(),
+                value: "abc".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_storage_write_entries_json_roundtrip() {
+        let origin = restore_test_origin();
+        let json = storage_write_entries_json(&origin);
+        let parsed: Vec<(bool, String, String)> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(
+            parsed[0],
+            (
+                true,
+                "persistence-test".to_string(),
+                "LP_RESTORE_OK".to_string()
+            )
+        );
+        assert_eq!(
+            parsed[1],
+            (
+                true,
+                "tricky\"key\\with\nnewline".to_string(),
+                "val</script>✓".to_string()
+            )
+        );
+        assert_eq!(
+            parsed[2],
+            (false, "tab-state".to_string(), "abc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_storage_write_js_embeds_entries_and_setters() {
+        let origin = restore_test_origin();
+        let js = storage_write_js(&origin);
+        assert!(js.contains(&storage_write_entries_json(&origin)));
+        assert!(js.contains("localStorage"));
+        assert!(js.contains("sessionStorage"));
+        assert!(js.contains("setItem"));
+        assert!(js.contains("return entries.length"));
+    }
+
+    #[test]
+    fn test_storage_verify_js_lists_keys_in_order() {
+        let origin = restore_test_origin();
+        let js = storage_verify_js(&origin);
+        assert!(js.contains("getItem"));
+        assert!(js.contains(r#""persistence-test""#));
+        assert!(js.contains(r#""tab-state""#));
+        // The verify snippet never writes.
+        assert!(!js.contains("setItem"));
+    }
+
+    #[test]
+    fn test_verify_storage_values_accepts_matching_readback() {
+        let origin = restore_test_origin();
+        let read = json!([
+            [true, "persistence-test", "LP_RESTORE_OK"],
+            [true, "tricky\"key\\with\nnewline", "val</script>✓"],
+            [false, "tab-state", "abc"],
+        ]);
+        assert!(verify_storage_values(&origin, &read).is_ok());
+    }
+
+    #[test]
+    fn test_verify_storage_values_rejects_missing_key() {
+        let origin = restore_test_origin();
+        let read = json!([
+            [true, "persistence-test", "LP_RESTORE_OK"],
+            [true, "tricky\"key\\with\nnewline", null],
+            [false, "tab-state", "abc"],
+        ]);
+        let err = verify_storage_values(&origin, &read).unwrap_err();
+        assert!(err.contains("was not restored"));
+        assert!(err.contains("http://127.0.0.1:8765"));
+    }
+
+    #[test]
+    fn test_verify_storage_values_rejects_wrong_value() {
+        let origin = restore_test_origin();
+        let read = json!([
+            [true, "persistence-test", "STALE"],
+            [true, "tricky\"key\\with\nnewline", "val</script>✓"],
+            [false, "tab-state", "abc"],
+        ]);
+        assert!(verify_storage_values(&origin, &read).is_err());
+    }
+
+    #[test]
+    fn test_verify_storage_values_rejects_wrong_count() {
+        let origin = restore_test_origin();
+        let read = json!([[true, "persistence-test", "LP_RESTORE_OK"]]);
+        let err = verify_storage_values(&origin, &read).unwrap_err();
+        assert!(err.contains("expected 3 entries, read back 1"));
+    }
+
+    #[test]
+    fn test_verify_storage_values_rejects_non_array() {
+        let origin = restore_test_origin();
+        let err = verify_storage_values(&origin, &json!({"not": "an array"})).unwrap_err();
+        assert!(err.contains("unexpected response"));
     }
 }
