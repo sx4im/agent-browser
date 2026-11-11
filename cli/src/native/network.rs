@@ -199,6 +199,16 @@ async fn install_domain_filter_runtime_script(
         return Ok(());
     }
 
+    // A target paused before its first document has no execution context to
+    // patch, and Runtime.evaluate waits for the debugger to resume, which
+    // only happens after this install returns. Evaluating here would hang
+    // until the CDP timeout and the target would never be resumed. The
+    // Page.addScriptToEvaluateOnNewDocument registered by the caller covers
+    // every document the target will load, so there is nothing to patch now.
+    if paused_before_document {
+        return Ok(());
+    }
+
     let script = domain_filter_script(allowed_domains);
     let evaluation = match client
         .send_command(
@@ -693,17 +703,23 @@ mod tests {
     async fn install_script_with_runtime_error(
         message: &'static str,
         paused_before_document: bool,
-    ) -> Result<(), String> {
+    ) -> (Result<(), String>, Vec<String>) {
         use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
         use tokio_tungstenite::tungstenite::Message;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
+        let methods: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let methods_for_server = methods.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             while let Some(Ok(Message::Text(text))) = ws.next().await {
                 let request: Value = serde_json::from_str(&text).unwrap();
+                if let Some(method) = request["method"].as_str() {
+                    methods_for_server.lock().unwrap().push(method.to_string());
+                }
                 let mut response = json!({ "id": request["id"] });
                 if request["method"] == "Runtime.evaluate" {
                     response["error"] = json!({ "code": -32000, "message": message });
@@ -724,23 +740,25 @@ mod tests {
         .await;
         drop(client);
         server.abort();
-        result
+        let methods = methods.lock().unwrap().clone();
+        (result, methods)
     }
 
     #[tokio::test]
     async fn domain_filter_script_skips_targets_without_a_context() {
         assert_eq!(
-            install_script_with_runtime_error("Cannot find default execution context", true).await,
+            install_script_with_runtime_error("Cannot find default execution context", true)
+                .await
+                .0,
             Ok(())
         );
     }
 
     #[tokio::test]
     async fn domain_filter_script_fails_closed_without_a_context_on_live_targets() {
-        let error =
-            install_script_with_runtime_error("Cannot find default execution context", false)
-                .await
-                .unwrap_err();
+        let (result, _) =
+            install_script_with_runtime_error("Cannot find default execution context", false).await;
+        let error = result.unwrap_err();
         assert!(
             error.contains("Cannot find default execution context"),
             "{}",
@@ -749,15 +767,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn domain_filter_script_fails_closed_on_other_runtime_errors() {
-        let error = install_script_with_runtime_error("Execution context was destroyed.", true)
-            .await
-            .unwrap_err();
+    async fn domain_filter_script_never_evaluates_paused_targets() {
+        // A target paused before its first document has no execution context
+        // to patch, so the install must not send Runtime.evaluate at all: on
+        // some Chrome versions the evaluate does not fail fast but waits for
+        // the target to resume, which never happens until these controls
+        // install, so the command times out and the target stays paused
+        // forever (see #2574). The Page.addScriptToEvaluateOnNewDocument
+        // installed just before covers every document the target will load.
+        // Even a fatal-looking evaluate error must not fail the install here,
+        // because the evaluate is never sent.
+        let (result, methods) =
+            install_script_with_runtime_error("Execution context was destroyed.", true).await;
+        assert_eq!(result, Ok(()));
+        assert_eq!(methods, vec!["Page.addScriptToEvaluateOnNewDocument"]);
+    }
+
+    #[tokio::test]
+    async fn domain_filter_script_still_evaluates_live_targets() {
+        // A live target does have a context to patch, so the evaluate is
+        // sent and its errors still fail the install closed.
+        let (result, methods) =
+            install_script_with_runtime_error("Execution context was destroyed.", false).await;
+        let error = result.unwrap_err();
         assert!(
             error.contains("Execution context was destroyed"),
             "{}",
             error
         );
+        assert!(methods.contains(&"Runtime.evaluate".to_string()));
     }
 
     #[test]
