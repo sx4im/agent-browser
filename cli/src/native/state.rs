@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CloseTargetParams, CreateTargetParams,
-    CreateTargetResult, EvaluateParams,
+    CreateTargetResult, EvaluateParams, EvaluateResult,
 };
 use super::cookies::{self, Cookie};
 use crate::validation::{is_valid_session_name, sanitize_session_component, session_name_error};
@@ -462,7 +462,12 @@ pub fn validate_state_file(path: &str) -> Result<(), String> {
 
 /// Restore cookies and per-origin storage from a state file.
 ///
-/// Storage is written through CDP DOMStorage, so no page script sees the values and Chrome only accepts the write when a frame is at the saved origin. Origins that redirect elsewhere or fail to load are skipped and returned.
+/// Storage is written by evaluating setItem calls in a frame navigated to
+/// the saved origin, and every value is read back before the origin counts
+/// as restored. The DOMStorage CDP domain is not implemented by every engine
+/// (Lightpanda has no DOMStorage domain, so restoring through it failed for
+/// every origin), while Runtime.evaluate is. Origins that redirect elsewhere
+/// or fail to load are skipped and returned.
 pub async fn load_state(
     client: &CdpClient,
     session_id: &str,
@@ -498,6 +503,79 @@ pub async fn load_state(
     Ok(skipped)
 }
 
+/// How long restore waits for the origin page to load before giving up on
+/// that origin. The old code slept a fixed 500ms and wrote regardless of
+/// whether the page had loaded; waiting for the load event is both faster on
+/// slow pages and correct on fast ones.
+const RESTORE_LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Evaluate a JS expression in the page and return its value.
+///
+/// `Runtime.evaluate` is implemented by every engine agent-browser drives,
+/// including ones without a DOMStorage CDP domain, so restore uses it instead
+/// of `DOMStorage.setDOMStorageItem`.
+async fn eval_in_page(
+    client: &CdpClient,
+    session_id: &str,
+    expression: &str,
+) -> Result<Value, String> {
+    let result: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &EvaluateParams {
+                expression: expression.to_string(),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await?;
+    if let Some(details) = result.exception_details {
+        return Err(format!("Page evaluation failed: {}", details.text));
+    }
+    Ok(result.result.value.unwrap_or(Value::Null))
+}
+
+/// Build the JS that writes every entry into one storage object and returns
+/// how many entries read back with the expected value. Keys and values are
+/// JSON-encoded, so quotes, backslashes, and non-ASCII survive verbatim.
+fn restore_storage_script(is_local_storage: bool, entries: &[StorageEntry]) -> String {
+    let store = if is_local_storage {
+        "localStorage"
+    } else {
+        "sessionStorage"
+    };
+    let items = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string());
+    format!(
+        r#"(() => {{
+            const items = {};
+            const store = {};
+            for (const item of items) {{
+                try {{
+                    store.setItem(item.name, item.value);
+                }} catch (e) {{
+                    return -1;
+                }}
+            }}
+            let restored = 0;
+            for (const item of items) {{
+                if (store.getItem(item.name) === item.value) {{
+                    restored += 1;
+                }}
+            }}
+            return restored;
+        }})()"#,
+        items, store
+    )
+}
+
+/// Whether the page the frame landed on is the origin the storage belongs to.
+/// Compared after trimming a trailing slash, since `location.origin` never
+/// carries one while saved origins sometimes do.
+fn origin_matches(actual: &str, expected: &str) -> bool {
+    actual.trim_end_matches('/') == expected.trim_end_matches('/')
+}
+
 async fn restore_origin_storage(
     client: &CdpClient,
     session_id: &str,
@@ -509,6 +587,14 @@ async fn restore_origin_storage(
         .filter(|o| o.is_tuple())
         .map(|o| o.ascii_serialization())
         .unwrap_or_else(|| origin.origin.trim_end_matches('/').to_string());
+
+    // Subscribe before navigating so the load event for this navigation
+    // cannot be missed. Page.enable is idempotent when already enabled.
+    let _ = client
+        .send_command_no_params("Page.enable", Some(session_id))
+        .await;
+    let mut event_rx = client.subscribe();
+
     client
         .send_command(
             "Page.navigate",
@@ -516,28 +602,68 @@ async fn restore_origin_storage(
             Some(session_id),
         )
         .await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
-    let entries = origin
-        .local_storage
-        .iter()
-        .map(|e| (true, e))
-        .chain(origin.session_storage.iter().map(|e| (false, e)));
-    for (is_local_storage, entry) in entries {
-        client
-            .send_command(
-                "DOMStorage.setDOMStorageItem",
-                Some(json!({
-                    "storageId": {
-                        "securityOrigin": security_origin,
-                        "isLocalStorage": is_local_storage,
-                    },
-                    "key": entry.name,
-                    "value": entry.value,
-                })),
-                Some(session_id),
-            )
-            .await?;
+    let loaded = tokio::time::timeout(RESTORE_LOAD_TIMEOUT, async {
+        loop {
+            match event_rx.recv().await {
+                Ok(evt) => {
+                    if evt.method == "Page.loadEventFired"
+                        && evt.session_id.as_deref() == Some(session_id)
+                    {
+                        return true;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return false,
+            }
+        }
+    })
+    .await;
+    if loaded != Ok(true) {
+        return Err(format!(
+            "Timed out waiting for {} to load while restoring storage",
+            security_origin
+        ));
+    }
+
+    // Never write the values into a page that landed elsewhere: a redirect
+    // to another origin would silently store them under the wrong origin.
+    let current_origin = eval_in_page(client, session_id, "location.origin").await?;
+    let current_origin = current_origin.as_str().unwrap_or("");
+    if !origin_matches(current_origin, &security_origin) {
+        return Err(format!(
+            "Origin changed while restoring storage: expected {} but landed on {}",
+            security_origin, current_origin
+        ));
+    }
+
+    for (is_local_storage, entries) in [
+        (true, &origin.local_storage),
+        (false, &origin.session_storage),
+    ] {
+        if entries.is_empty() {
+            continue;
+        }
+        let restored = eval_in_page(
+            client,
+            session_id,
+            &restore_storage_script(is_local_storage, entries),
+        )
+        .await?;
+        let restored = restored.as_i64().unwrap_or(-1);
+        if restored != entries.len() as i64 {
+            return Err(format!(
+                "Restored only {} of {} {} entries for origin {}",
+                restored,
+                entries.len(),
+                if is_local_storage {
+                    "localStorage"
+                } else {
+                    "sessionStorage"
+                },
+                security_origin
+            ));
+        }
     }
     Ok(())
 }
@@ -1021,6 +1147,56 @@ mod tests {
         assert_eq!(json["httpOnly"], false);
         assert_eq!(json["secure"], true);
         assert_eq!(json["sameSite"], "Strict");
+    }
+
+    #[test]
+    fn test_restore_storage_script_writes_entries_and_counts() {
+        let entries = vec![
+            StorageEntry {
+                name: "plain".to_string(),
+                value: "v1".to_string(),
+            },
+            StorageEntry {
+                name: "qu\"ote".to_string(),
+                value: "back\\slash\nline".to_string(),
+            },
+        ];
+        let script = restore_storage_script(true, &entries);
+        assert!(script.contains("localStorage"));
+        assert!(!script.contains("sessionStorage"));
+        assert!(script.contains(r#""name":"qu\"ote""#));
+        assert!(script.contains(r#""value":"back\\slash\nline""#));
+        assert!(script.contains("setItem(item.name, item.value)"));
+        assert!(script.contains("return restored;"));
+
+        let session_script = restore_storage_script(false, &entries);
+        assert!(session_script.contains("sessionStorage"));
+        assert!(!session_script.contains("localStorage"));
+    }
+
+    #[test]
+    fn test_restore_storage_script_empty_entries() {
+        let script = restore_storage_script(true, &[]);
+        assert!(script.contains("const items = [];"));
+        assert!(script.contains("return restored;"));
+    }
+
+    #[test]
+    fn test_origin_matches() {
+        assert!(origin_matches(
+            "http://127.0.0.1:8765",
+            "http://127.0.0.1:8765"
+        ));
+        assert!(origin_matches(
+            "http://127.0.0.1:8765",
+            "http://127.0.0.1:8765/"
+        ));
+        assert!(!origin_matches(
+            "http://127.0.0.1:8765",
+            "http://127.0.0.1:9999"
+        ));
+        assert!(!origin_matches("https://example.com", "http://example.com"));
+        assert!(!origin_matches("", "http://example.com"));
     }
 
     #[test]
